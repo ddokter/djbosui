@@ -1,0 +1,510 @@
+from django.views.generic.detail import DetailView as BaseDetailView
+from django.views.generic.edit import CreateView as BaseCreateView
+from django.views.generic.edit import UpdateView as BaseUpdateView
+from django.views.generic.edit import DeleteView as BaseDeleteView
+from django.views.generic import FormView
+from django import forms
+from django.urls import reverse, reverse_lazy
+from django.urls.exceptions import NoReverseMatch
+from django.utils.translation import gettext_lazy as _
+from django.contrib.contenttypes.models import ContentType
+from django.apps import apps
+from django.conf import settings
+from ..utils import get_model_name
+from ..forms.dtinput import DateTimeInput
+from ..forms.colorpicker import ColorInput
+from .formset import FormSetMixin
+
+
+class SearchForm(forms.Form):
+
+    query = forms.CharField(required=False)
+
+
+class CTypeMixin(object):
+
+    def get_model(self):
+
+        """ Get the model class for the view """
+
+        if getattr(self, 'object', None):
+            if hasattr(self.object, 'get_real_instance'):
+                model = self.object.get_real_instance()._meta.model
+            else:
+                model = self.object._meta.model
+        else:
+            model = self.model
+
+        return model
+
+    @property
+    def ctype(self):
+
+        """Determine content type, keeping in mind that some views
+        are on polymorphic types. The content type includes the app
+        name.
+
+        """
+
+        app = self.get_model()._meta.app_label
+        model = self.get_model().__name__.lower()
+
+        return f"{app}.{model}"
+
+    @property
+    def ct_id(self):
+
+        app = self.get_model()._meta.app_label
+
+        return ContentType.objects.get(app_label=app, model=self.ctype).id
+
+    @property
+    def ct_label(self):
+
+        return _(self.get_model()._meta.verbose_name.capitalize())
+
+    @property
+    def view_type(self):
+
+        """ Return one of: list, detail, edit, create, delete, other """
+
+        return ""
+
+    @property
+    def view_name(self):
+
+        """  Return a tuple of model name and view type """
+
+        return (self.ctype, self.view_type)
+
+    @property
+    def listing_label(self):
+
+        return _(self.get_model()._meta.verbose_name_plural.capitalize())
+
+    @property
+    def listing_url(self):
+
+        return reverse_lazy("list", kwargs={'model': self.ctype})
+
+
+class GenericMixin:
+
+    _model = None
+
+    @property
+    def model(self):
+
+        if self.kwargs.get('model', None):
+
+            try:
+                ns, model = self.kwargs["model"].split(".")
+            except ValueError:
+                ns = settings.DEFAULT_MODEL_NS
+                model = self.kwargs['model']
+
+            mdl = apps.get_model(ns, model)
+
+            if mdl._meta.swappable:
+
+                module, model = getattr(settings,
+                                        mdl._meta.swappable).split(".")
+
+                return apps.get_model(module, model)
+
+            return mdl
+
+        else:
+            return self._model
+
+    @model.setter
+    def model(self, value):
+
+        self._model = value
+
+    @property
+    def success_url(self):
+
+        modelname = self.kwargs.get('model', self.model.__name__.lower())
+
+        return reverse("list", kwargs={'model': modelname})
+
+    @property
+    def cancel_url(self):
+
+        return self.success_url
+
+
+class InlineActionMixin:
+
+    @property
+    def parent(self):
+
+        if getattr(self, "_parent", None):
+            return self._parent
+        
+        try:
+            ns, model = self.kwargs["parent_model"].split(".")
+        except ValueError:
+            ns = settings.DEFAULT_MODEL_NS
+            model = self.kwargs['parent_model']
+
+        parent_model = apps.get_model(ns, model)
+
+        self._parent = parent_model.objects.get(id=self.kwargs['parent_pk'])
+
+        return self._parent
+        
+    def get_initial(self):
+
+        """May also be parented by contenttypes, so set those values
+        as well
+
+        """
+
+        initial = {
+            self.fk_field: self.parent,
+            'content_type': ContentType.objects.get_for_model(self.parent).id,
+            'object_id': self.parent.id
+        }
+
+        return initial
+
+    @property
+    def fk_field(self):
+
+        """Field used for fk of parent. For this we need to get rid
+        of the app part
+
+        """
+
+        model_name = get_model_name(self.parent, base=True)
+        
+        return self.request.GET.get('fk_field', model_name)
+
+    @property
+    def success_url(self):
+
+        return reverse("view", kwargs={
+            'pk': self.parent.pk,
+            'model': self.kwargs['parent_model']
+        })
+
+    def get_form(self, form_class=None):
+
+        form = super().get_form(form_class=form_class)
+
+        try:
+            field_defs = self.parent.child_fk_qs.get(self.ctype)
+
+            for field in field_defs.keys():
+                form.fields[field].queryset = field_defs[field]
+
+        except (KeyError, AttributeError):
+            pass
+
+        # Always use DateTimeWidget...
+        #
+        for field in form.fields:
+            if form.fields[field].__class__.__name__ == 'DateTimeField':
+                form.fields[field].widget = DateTimeInput()
+
+        # Patch Textarea
+        #
+        for field in form.fields:
+            if form.fields[field].widget.__class__.__name__ == "Textarea":
+                form.fields[field].widget.attrs['rows'] = 3
+
+        # Hide parent, if possible
+        #
+        for fname in [self.fk_field, "object_id", "content_type"]:
+            try:
+                form.fields[fname].widget = forms.HiddenInput()
+            except KeyError:
+                pass
+
+        return form
+
+
+class CreateView(GenericMixin, FormSetMixin, BaseCreateView, CTypeMixin):
+
+    """ Base create view that enables creation within a parent """
+
+    fields = "__all__"
+    view_type = "create"
+
+    def check_permission(self, request):
+
+        permission = self.get_permission(request)
+
+        if not permission:
+            return True
+
+        try:
+            obj = self.get_object()
+        except BaseException:
+            try:
+                obj = self.get_parent()
+            except BaseException:
+                obj = None
+
+        return request.user.has_perm(permission, obj=obj)
+
+    @property
+    def permission(self):
+
+        return f"{settings.DEFAULT_MODEL_NS}.add_%s" % self.ctype
+
+    def get_template_names(self):
+
+        if self.template_name:
+            return [self.template_name]
+
+        return ["%s_create.html" % self.ctype, "base_create.html"]
+
+    @property
+    def success_url(self):
+
+        if self.object:
+            return reverse("view", kwargs={
+                'pk': self.object.id,
+                'model': self.ctype
+            })
+
+        return super().success_url
+
+    @property
+    def action_url(self):
+
+        #try:
+        #    action_url = reverse("%s_%s" % (self.view_type, self.ctype))
+        #except NoReverseMatch:
+        #   action_url = reverse(self.view_type, kwargs={'model': self.ctype})
+
+        return "."  # action_url
+
+
+class UpdateView(GenericMixin, FormSetMixin, BaseUpdateView, CTypeMixin):
+
+    view_type = "edit"
+
+    @property
+    def fields(self):
+
+        if not hasattr(self.object, 'readonly'):
+            return "__all__"
+        else:
+            return [field.name for field in self.object._meta.fields
+                    if field.editable
+                    and field.name not in self.object.readonly]
+
+    @property
+    def permission(self):
+
+        return f"{DEFAULT_MODEL_NS}.change_%s" % self.ctype
+
+    def get_template_names(self):
+
+        return ["%s_update.html" % self.ctype, "base_update.html"]
+
+    @property
+    def action_url(self):
+
+        try:
+            action_url = reverse("%s_%s" % (self.view_type, self.ctype),
+                                 kwargs={'pk': self.object.id})
+        except NoReverseMatch:
+            action_url = reverse(self.view_type,
+                                 kwargs={'model': self.ctype,
+                                         'pk': self.object.id})
+
+        return action_url
+
+    @property
+    def success_url(self):
+
+        return reverse("view", kwargs={
+            'pk': self.object.id,
+            'model': self.ctype
+        })
+
+
+class DetailView(GenericMixin, BaseDetailView, CTypeMixin):
+
+    """ Base detail view """
+
+    view_type = "detail"
+
+    @property
+    def permission(self):
+
+        """ provide content type specific permission """
+
+        return f"{settings.DEFAULT_MODEL_NS}.view_{self.ctype}"
+
+    def get_template_names(self):
+
+        """ Override for returning a specific or the default template """
+
+        if self.template_name:
+            return [self.template_name]
+
+        app, model = self.ctype.split(".")
+
+        return [f"{app}/{model}_detail.html", "base_detail.html"]
+
+    def properties(self):
+
+        """ Return a list of fields and values for the given object """
+
+        _props = []
+        skip = ["name", "id"]
+
+        for field in self.object._meta.fields:
+
+            if field.name in skip:
+                continue
+
+            try:
+                value = getattr(self.object, f"get_{field.name}_display")()
+            except AttributeError:
+                value = getattr(self.object, field.name)
+
+            if isinstance(value, list):
+                value = ", ".join([str(part) for part in value])
+
+            _props.append((field.verbose_name, value))
+
+        for field in self.object._meta.many_to_many:
+
+            qs = getattr(self.object, field.name)
+
+            values = [str(val) for val in list(qs.all())]
+
+            _props.append((field.verbose_name, ", ".join(values)))
+
+        return _props
+
+
+class DeleteView(GenericMixin, BaseDeleteView):
+
+    """Delete view that takes a model as argument, and may take a
+    list_url_name to point to the listing view of the specifiek model.
+
+    """
+
+    template_name = "confirm_delete.html"
+    _list_url = None
+    view_type = "delete"
+
+    @property
+    def success_url(self):
+
+        """ What to do after delete? """
+
+        return reverse_lazy("list", kwargs={'model':get_model_name(self.model)})
+
+    @success_url.setter
+    def success_url(self, value):
+
+        self._list_url = value
+
+    @property
+    def cancel_url(self):
+
+        return self.success_url
+
+
+class ListingView(GenericMixin, FormView, CTypeMixin):
+
+    permission = f"{settings.DEFAULT_MODEL_NS}.manage_products"
+    form_class = SearchForm
+    query = None
+    view_type = "list"
+    
+    def get_template_names(self):
+
+        """ Override for returning a specific or the default template """
+
+        if self.template_name:
+            return [self.template_name]
+
+        app, model = self.ctype.split(".")
+
+        return [f"{app}/{model}_listing.html", "base_listing.html"]
+
+    def list_items(self):
+
+        """ Return the items to be shown in the actual list """
+
+        method = self.kwargs.get('method', 'all')
+
+        items = getattr(self.model.objects, method)()
+
+        if getattr(self.model, "_prefetch_related", None):
+            items = items.prefetch_related(*self.model._prefetch_related)
+
+        if self.query:
+
+            items = [item for item in items if
+                     self.query.lower() in str(item).lower()]
+
+        return items
+
+    def form_valid(self, form):
+
+        self.query = form.cleaned_data['query']
+
+        context = self.get_context_data()
+
+        return self.render_to_response(context)
+
+
+class InlineCreateView(InlineActionMixin, CreateView):
+
+    @property
+    def success_url(self):
+
+        return reverse("view", kwargs={
+            'pk': self.parent.pk,
+            'model': get_model_name(self.parent)})
+
+    @property
+    def action_url(self):
+
+        return reverse("inline_create", kwargs={
+            'parent_pk': self.parent.id,
+            'parent_model': get_model_name(self.parent),
+            'model': self.ctype
+        })
+
+
+class InlineUpdateView(InlineActionMixin, UpdateView):
+
+    @property
+    def success_url(self):
+
+        return reverse("view", kwargs={
+            'pk': self.parent.pk,
+            'model': get_model_name(self.parent)})
+
+    @property
+    def action_url(self):
+
+        return reverse("inline_edit", kwargs={
+            'parent_pk': self.parent.id,
+            'parent_model': get_model_name(self.parent),
+            'model': self.ctype,
+            'pk': self.kwargs['pk']
+        })
+
+
+class InlineDeleteView(InlineActionMixin, DeleteView):
+
+    @property
+    def success_url(self):
+
+        if 'success_url' in self.request.POST:
+            return self.request.POST['success_url']
+
+        return self.request.META.get('HTTP_REFERER')

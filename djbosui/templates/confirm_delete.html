@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+
+{% load i18n %}
+
+{% block content %}
+<div class="alert alert-danger">
+  {% blocktrans with object=object %}Do you really want to delete {{ object }}?
+  {% endblocktrans %}
+</div>
+
+<form action=""
+      method="POST" 
+      class="form">
+
+    {% csrf_token %}
+
+    <input type="hidden" name="success_url" value="{{ view.success_url }}" />
+    
+    <div class="btn-group" role="group" aria-label="Form controls">    
+      <button type="submit" class="btn btn-primary">
+	{% trans 'Yes' %}
+      </button>
+      <a href="{{ view.cancel_url }}" class="btn btn-default">
+	{% trans 'Cancel' %}
+      </a>
+    </div>
+
+</form>
+
+{% endblock %}
